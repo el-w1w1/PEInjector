@@ -219,6 +219,119 @@ BOOL FixReloc(IN PIMAGE_DATA_DIRECTORY pEntryBaseRelocDataDir, IN ULONG_PTR pPeB
     return TRUE; 
 }
 
+BOOL FixImportAddressTable(IN PIMAGE_DATA_DIRECTORY pEntryImportDataDir, IN PBYTE pPeBaseAddress) {
+
+    /* get image_import_descriptor -> will list all dlls to import */
+    PIMAGE_IMPORT_DESCRIPTOR pImgDescriptor = NULL;
+
+    // loop through imp_desc
+    for (size_t i = 0; i < pEntryImportDataDir->Size; i += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+
+        // get current image_import_descriptor
+        pImgDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)(pPeBaseAddress + pEntryImportDataDir->VirtualAddress + i);
+
+        // reached end when both null 
+        if (pImgDescriptor->FirstThunk == NULL && pImgDescriptor->OriginalFirstThunk == NULL) {
+            break; 
+        }
+
+        LPSTR cDllName = (LPSTR)(pPeBaseAddress + pImgDescriptor->Name); 
+        ULONG_PTR uOriginalFirstThunkRVA = pImgDescriptor->OriginalFirstThunk; 
+        ULONG_PTR uFirstThunkRVA = pImgDescriptor->FirstThunk; 
+        SIZE_T ImgThunkSize = 0x00; // iterate through IAT & INT 
+
+        HMODULE hModule = NULL; 
+
+        if (!(hModule = LoadLibraryA(cDllName))) {
+            printWinapiErr(L"LoadLibraryA"); 
+            return FALSE; 
+        }
+
+        /* Iterate over loaded DLL & resolve funcs*/
+        while (TRUE) {
+
+            // get first thunk (IAT) and orig first thunk (INT)
+            PIMAGE_THUNK_DATA pOriginalFirstThunk = (PIMAGE_THUNK_DATA)(pPeBaseAddress + uOriginalFirstThunkRVA + ImgThunkSize); 
+            PIMAGE_THUNK_DATA pFirstThunk = (PIMAGE_THUNK_DATA)(pPeBaseAddress + uFirstThunkRVA + ImgThunkSize); 
+            ULONG_PTR pFuncAddress = NULL; 
+
+            // first thunk and orig thunk same rn but need to use INT to path IAT 
+
+            // break when end of THUNK (no more funcs to resolve) 
+            if (pOriginalFirstThunk->u1.Function == NULL && pFirstThunk->u1.Function == NULL) {
+                break; 
+            }
+
+
+            // import by ordinal or func name 
+            if (IMAGE_SNAP_BY_ORDINAL(pOriginalFirstThunk->u1.Ordinal)) {
+                if (!(pFuncAddress = GetProcAddress(hModule, IMAGE_ORDINAL(pOriginalFirstThunk->u1.Ordinal))) ){
+                    printf("Can't import !%s#%d \n", cDllName, (int)pOriginalFirstThunk->u1.Ordinal); 
+                    return FALSE; 
+                }
+            } // import function by name 
+            else {
+                PIMAGE_IMPORT_BY_NAME pImgName = (PIMAGE_IMPORT_BY_NAME)(pPeBaseAddress + pOriginalFirstThunk->u1.AddressOfData); 
+                if (!(pFuncAddress = GetProcAddress(hModule, pImgName->Name))) {
+                    printf("Could not Import !%s.%s \n", cDllName, pImgName->Name); 
+                    return FALSE; 
+                }
+            }
+
+            // set function addr in IAT 
+            pFirstThunk->u1.Function = (ULONGLONG)pFuncAddress; 
+
+            // move to next func in IAT/INT arr 
+            ImgThunkSize += sizeof(IMAGE_THUNK_DATA); 
+        }
+
+
+    }
+    return TRUE; 
+}
+
+BOOL FixMemPermissions(IN PBYTE pPeBaseAddress, IN PIMAGE_NT_HEADERS pImgNtHdrs, IN PIMAGE_SECTION_HEADER pImgSecHdr) {
+
+    // loop through each section 
+    for (DWORD i = 0; i < pImgNtHdrs->FileHeader.NumberOfSections; i++) {
+        DWORD dwProtection = 0x00, dwOldProtection = 0x00; 
+
+        // skip if empty 
+        if (!pImgSecHdr[i].SizeOfRawData || !pImgSecHdr[i].VirtualAddress) {
+            continue; 
+        }
+
+        /* determine mem protections */
+        DWORD secchar = pImgSecHdr[i].Characteristics;
+
+        /* big if for all vals */
+        if (secchar & IMAGE_SCN_MEM_WRITE)
+            dwProtection = PAGE_WRITECOPY;
+        if (secchar & IMAGE_SCN_MEM_READ)
+            dwProtection = PAGE_READONLY;
+        if (secchar & IMAGE_SCN_MEM_EXECUTE)
+            dwProtection = PAGE_EXECUTE;    
+        if ((secchar & IMAGE_SCN_MEM_READ) && (secchar & IMAGE_SCN_MEM_WRITE))
+            dwProtection = PAGE_READWRITE; 
+        if ((secchar & IMAGE_SCN_MEM_READ) && (secchar & IMAGE_SCN_MEM_EXECUTE))
+            dwProtection = PAGE_EXECUTE_READ;
+        if ((secchar & IMAGE_SCN_MEM_EXECUTE) && (secchar & IMAGE_SCN_MEM_WRITE))
+            dwProtection = PAGE_EXECUTE_WRITECOPY;
+        if ((secchar & IMAGE_SCN_MEM_READ) && (secchar & IMAGE_SCN_MEM_WRITE) && (secchar & IMAGE_SCN_MEM_EXECUTE))
+            dwProtection = PAGE_EXECUTE_READWRITE;
+
+        /* virtual protect the area of mem */
+        if (!VirtualProtect((PVOID)(pPeBaseAddress + pImgSecHdr[i].VirtualAddress), pImgSecHdr[i].SizeOfRawData, dwProtection, &dwOldProtection)) {
+            printWinapiErr(L"VirtualProtect");
+            return FALSE; 
+        }
+
+
+    }
+    return TRUE;
+}
+
+
 BOOL LocalPeExec(IN PPE_HDRS pPeHdrs) {
     //BYTE PeBaseAddr = { 0 };
     PBYTE pPeBaseAddr = NULL; 
@@ -229,7 +342,32 @@ BOOL LocalPeExec(IN PPE_HDRS pPeHdrs) {
     if(!FixReloc(pPeHdrs->pEntryBaseRelocDataDir, pPeBaseAddr, pPeHdrs->pImgNtHdrs->OptionalHeader.ImageBase)) {
         return FALSE; 
     }
+    if (!FixImportAddressTable(pPeHdrs->pEntryImportDataDir, pPeBaseAddr)) {
+        return FALSE; 
+    }
+
+    if (!FixMemPermissions(pPeBaseAddr, pPeHdrs->pImgNtHdrs, pPeHdrs->pImgSecHdr)) {
+        return FALSE; 
+    }
+
+    PBYTE entryPt = pPeHdrs->pImgNtHdrs->OptionalHeader.AddressOfEntryPoint + pPeBaseAddr;
+    /* executing DLL */
+    if ((pPeHdrs->pImgNtHdrs->FileHeader.Characteristics & 0x2000) == 0x2000) {
+        printf("[+] IS DLL");
+        typedef BOOL(WINAPI* DLLMAIN)(HINSTANCE, DWORD, LPVOID);
+        DLLMAIN pDllMain = (DLLMAIN)entryPt; 
+        pDllMain((HINSTANCE)pPeBaseAddr, DLL_PROCESS_ATTACH, NULL); 
+    } /* executing EXE */
+    else {
+        typedef BOOL(WINAPI* MAIN)(); 
+        MAIN pMain = (MAIN)entryPt; 
+        pMain(); 
+        printf("[+] IS EXE");
+    }
 }
+
+
+
 /* Maldev Local PE Loader (prelude to DLL equivalent) */
 void PELoader() {
 /* read in PE file (can replace w network comm) */
