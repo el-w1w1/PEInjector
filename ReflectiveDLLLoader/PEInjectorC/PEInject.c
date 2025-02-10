@@ -332,6 +332,55 @@ BOOL FixMemPermissions(IN PBYTE pPeBaseAddress, IN PIMAGE_NT_HEADERS pImgNtHdrs,
 }
 
 
+BOOL RegisterExcpetionHandler(IN PBYTE pPeBaseAddress, IN PPE_HDRS pPeHdrs) {
+    // set exception handlers if exist 
+    if (pPeHdrs->pEntryExceptionDataDir->VirtualAddress) {
+        // retrieve func table addr 
+        PIMAGE_RUNTIME_FUNCTION_ENTRY pImgRuntimeFuncEntry = (PIMAGE_RUNTIME_FUNCTION_ENTRY)(pPeBaseAddress + pPeHdrs->pEntryExceptionDataDir->VirtualAddress); 
+        // register func table 
+        if (!RtlAddFunctionTable(pImgRuntimeFuncEntry, ((pPeHdrs->pEntryExceptionDataDir->Size) / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY)), pPeBaseAddress)) {
+            printWinapiErr(L"RtlAddFunctionTable"); 
+            return FALSE; 
+        }
+    }
+    return TRUE; 
+}
+
+BOOL TLSCallbacks(IN PBYTE pPeBaseAddress, IN PPE_HDRS pPeHdrs) {
+    // check if tls callbacks exist 
+    if (pPeHdrs->pEntryTLSDataDir->Size) {
+        // Get TLS dir 
+        PIMAGE_TLS_DIRECTORY pImgTlsDirectory = (PIMAGE_TLS_DIRECTORY)(pPeBaseAddress + pPeHdrs->pEntryTLSDataDir->VirtualAddress); 
+
+        PIMAGE_TLS_CALLBACK* pImgTlsCallback = (PIMAGE_TLS_CALLBACK*)(pImgTlsDirectory->AddressOfCallBacks); 
+
+        for (int i = 0; pImgTlsCallback[i] != NULL; i++) {
+            pImgTlsCallback[i]((LPVOID)pPeBaseAddress, DLL_PROCESS_ATTACH, NULL); 
+        }
+
+    }
+    return TRUE; 
+
+}
+
+PVOID FetchExportedFunctionAddress(IN PIMAGE_DATA_DIRECTORY pEntryExportDataDir, IN PBYTE pPeBaseAddress, IN LPCSTR cFuncName) {
+    /* get to func array */
+    PIMAGE_EXPORT_DIRECTORY pImgExportDir = (PIMAGE_EXPORT_DIRECTORY)pEntryExportDataDir->VirtualAddress;
+    PDWORD FunctionNameArray = (PDWORD)(pPeBaseAddress + pImgExportDir->AddressOfNames);
+    PDWORD FunctionAddressArray = (PDWORD)(pPeBaseAddress + pImgExportDir->AddressOfFunctions);
+    PWORD FunctionOrdinalArray = (PWORD)(pPeBaseAddress + pImgExportDir->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < pImgExportDir->NumberOfFunctions; i++) {
+        CHAR* pFunctionName = (CHAR*)(pPeBaseAddress + FunctionNameArray[i]);
+        PVOID pFunctionAddress = (PVOID)(pPeBaseAddress + FunctionAddressArray[FunctionOrdinalArray[i]]); 
+        
+        if (strcmp(cFuncName, pFunctionName) == 0) {
+            return pFunctionAddress; 
+        }
+    }
+    return NULL; 
+}
+
 BOOL LocalPeExec(IN PPE_HDRS pPeHdrs) {
     //BYTE PeBaseAddr = { 0 };
     PBYTE pPeBaseAddr = NULL; 
@@ -350,6 +399,12 @@ BOOL LocalPeExec(IN PPE_HDRS pPeHdrs) {
         return FALSE; 
     }
 
+    /* optional steps */
+    RegisterExcpetionHandler(pPeBaseAddr, pPeHdrs); 
+    TLSCallbacks(pPeBaseAddr, pPeHdrs); 
+
+
+
     PBYTE entryPt = pPeHdrs->pImgNtHdrs->OptionalHeader.AddressOfEntryPoint + pPeBaseAddr;
     /* executing DLL */
     if ((pPeHdrs->pImgNtHdrs->FileHeader.Characteristics & 0x2000) == 0x2000) {
@@ -357,6 +412,9 @@ BOOL LocalPeExec(IN PPE_HDRS pPeHdrs) {
         typedef BOOL(WINAPI* DLLMAIN)(HINSTANCE, DWORD, LPVOID);
         DLLMAIN pDllMain = (DLLMAIN)entryPt; 
         pDllMain((HINSTANCE)pPeBaseAddr, DLL_PROCESS_ATTACH, NULL); 
+
+        // call specific export 
+        PVOID getProcAddr = FetchExportedFunctionAddress(pPeHdrs->pEntryExportDataDir, pPeBaseAddr, "GetProcAddress"); // test for kernel32
     } /* executing EXE */
     else {
         typedef BOOL(WINAPI* MAIN)(); 
@@ -366,6 +424,50 @@ BOOL LocalPeExec(IN PPE_HDRS pPeHdrs) {
     }
 }
 
+BOOL FixArguments(IN OPTIONAL LPCSTR cArgumentsToPass) {
+    PRTL_USER_PROCESS_PARAMETERS	pParam = ((PPEB)__readgsqword(0x60))->ProcessParameters;
+
+    RtlSecureZeroMemory(pParam->CommandLine.Buffer, pParam->CommandLine.Length * sizeof(WCHAR));
+
+    if (cArgumentsToPass) {
+
+        WCHAR* wNewCommand = NULL;
+        WCHAR* wArgumentsToPass = NULL;
+        INT             iWideCharSize = 0x00;
+
+        // char => wchar
+        if (!(wArgumentsToPass = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (strlen(cArgumentsToPass) * sizeof(WCHAR) + sizeof(WCHAR))))) {
+            PRINT_WINAPI_ERR("HeapAlloc");
+            return;
+        }
+
+        CharStringToWCharString(wArgumentsToPass, cArgumentsToPass, (strlen(cArgumentsToPass) * sizeof(WCHAR) + sizeof(WCHAR)));
+
+        // Construct the new command line argument 
+        if (!(wNewCommand = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ((wcslen(wArgumentsToPass) + pParam->ImagePathName.Length) * sizeof(WCHAR) + sizeof(WCHAR))))) {
+            PRINT_WINAPI_ERR("HeapAlloc");
+            return;
+        }
+
+        wsprintfW(wNewCommand, L"\"%s\" %s", pParam->ImagePathName.Buffer, wArgumentsToPass);
+
+        // Overwrite the old one
+        lstrcpyW(pParam->CommandLine.Buffer, wNewCommand);
+        pParam->CommandLine.Length = pParam->CommandLine.MaximumLength = wcslen(pParam->CommandLine.Buffer) * sizeof(WCHAR) + sizeof(WCHAR);
+        pParam->CommandLine.MaximumLength += sizeof(WCHAR);
+
+        HeapFree(GetProcessHeap(), 0x00, wArgumentsToPass);
+        HeapFree(GetProcessHeap(), 0x00, wNewCommand);
+
+        return;
+    }
+
+    // No arguments: overwrite with image name only
+    lstrcpyW(pParam->CommandLine.Buffer, pParam->ImagePathName.Buffer);
+    pParam->CommandLine.Length = pParam->CommandLine.MaximumLength = wcslen(pParam->CommandLine.Buffer) * sizeof(WCHAR) + sizeof(WCHAR);
+    pParam->CommandLine.MaximumLength += sizeof(WCHAR);
+}
+
 
 
 /* Maldev Local PE Loader (prelude to DLL equivalent) */
@@ -373,7 +475,7 @@ void PELoader() {
 /* read in PE file (can replace w network comm) */
     PBYTE fileBuf = 0;
     DWORD fileSz = 0; 
-    if (!readFile("C:\\Windows\\System32\\calc.exe", &fileBuf, &fileSz)) {
+    if (!readFile("C:\\Windows\\System32\\kernel32.dll", &fileBuf, &fileSz)) {
         printf("failed to read file\n"); 
         return; 
     }
